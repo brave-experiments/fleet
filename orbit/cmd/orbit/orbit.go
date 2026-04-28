@@ -36,6 +36,7 @@ import (
 	"github.com/fleetdm/fleet/v4/orbit/pkg/augeas"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/bitlocker"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/build"
+	"github.com/fleetdm/fleet/v4/orbit/pkg/gitpolicy"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/constant"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/execuser"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/insecure"
@@ -253,6 +254,34 @@ func main() {
 			Name:    "disable-setup-experience",
 			Usage:   "Disables checking for setup experience on Linux or Windows hosts",
 			EnvVars: []string{"ORBIT_DISABLE_SETUP_EXPERIENCE"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-repo-url",
+			Usage:   "URL of the git repository used as the script execution policy (e.g. https://github.com/org/fleet-gitops). When set, orbit only runs scripts whose name exists in that repository, and always runs the content from git — never what the Fleet server sends.",
+			EnvVars: []string{"ORBIT_GIT_POLICY_REPO_URL"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-repo-branch",
+			Usage:   "Branch of the git policy repository to track",
+			Value:   "main",
+			EnvVars: []string{"ORBIT_GIT_POLICY_REPO_BRANCH"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-repo-dir",
+			Usage:   "Local directory where the git policy repository will be cloned. Defaults to <root-dir>/git-policy.",
+			EnvVars: []string{"ORBIT_GIT_POLICY_REPO_DIR"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-scripts-dir",
+			Usage:   "Subdirectory within the policy repository that contains approved scripts",
+			Value:   "scripts",
+			EnvVars: []string{"ORBIT_GIT_POLICY_SCRIPTS_DIR"},
+		},
+		&cli.DurationFlag{
+			Name:    "git-policy-sync-interval",
+			Usage:   "How often orbit re-syncs the git policy repository",
+			Value:   5 * time.Minute,
+			EnvVars: []string{"ORBIT_GIT_POLICY_SYNC_INTERVAL"},
 		},
 	}
 	app.Before = func(c *cli.Context) error {
@@ -1174,8 +1203,29 @@ func orbitAction(c *cli.Context) error {
 		windowsMDMBitlockerCommandFrequency    = time.Hour
 	)
 
+	var policyEnforcer *gitpolicy.Enforcer
+	if repoURL := c.String("git-policy-repo-url"); repoURL != "" {
+		repoDir := c.String("git-policy-repo-dir")
+		if repoDir == "" {
+			repoDir = filepath.Join(c.String("root-dir"), "git-policy")
+		}
+		policyEnforcer = gitpolicy.New(
+			repoURL,
+			c.String("git-policy-repo-branch"),
+			repoDir,
+			c.String("git-policy-scripts-dir"),
+			c.Duration("git-policy-sync-interval"),
+		)
+		policyCtx, policyCancel := context.WithCancel(context.Background())
+		defer policyCancel()
+		if err := policyEnforcer.Start(policyCtx); err != nil {
+			return fmt.Errorf("starting git policy enforcer: %w", err)
+		}
+		log.Info().Str("repo", repoURL).Msg("git execution policy enforcer active")
+	}
+
 	scriptConfigReceiver, scriptsEnabledFn := update.ApplyRunScriptsConfigFetcherMiddleware(
-		c.Bool("enable-scripts"), orbitClient, c.String("root-dir"),
+		c.Bool("enable-scripts"), orbitClient, c.String("root-dir"), policyEnforcer,
 	)
 	orbitClient.RegisterConfigReceiver(scriptConfigReceiver)
 

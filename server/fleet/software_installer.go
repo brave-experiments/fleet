@@ -442,6 +442,7 @@ Exit code: %d (Failed)
 %s
 `
 	SoftwareInstallerDownloadFailedCopy = "Installing software...\nError: Software installer download failed."
+	SoftwareInstallerPolicyBlockedCopy  = "Installing software...\nError: Blocked by git execution policy. The installer script hash is not in the allowlist."
 )
 
 // EnhanceOutputDetails is used to add extra boilerplate/information to the
@@ -471,6 +472,9 @@ func (h *HostSoftwareInstallerResult) EnhanceOutputDetails() {
 		return
 	case ExitCodeInstallerDownloadFailed:
 		*h.Output = SoftwareInstallerDownloadFailedCopy
+		return
+	case ExitCodePolicyBlocked:
+		*h.Output = SoftwareInstallerPolicyBlockedCopy
 		return
 	default:
 		h.Output = ptr.String(fmt.Sprintf(SoftwareInstallerInstallFailCopy, *h.Output))
@@ -1022,6 +1026,9 @@ const (
 	// ExitCodeInstallerDownloadFailed is a special exit code returned by fleetd in the
 	// HostSoftwareInstallResultPayload when fleetd failed to download the installer.
 	ExitCodeInstallerDownloadFailed = -3
+	// ExitCodePolicyBlocked is a special exit code returned by fleetd when a script or
+	// installer script was blocked by the host's git-backed execution policy.
+	ExitCodePolicyBlocked = -4
 )
 
 // SoftwareInstallerTokenMetadata is the metadata stored in Redis for a software installer token.

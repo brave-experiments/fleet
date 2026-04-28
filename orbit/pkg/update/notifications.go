@@ -286,6 +286,10 @@ type runScriptsConfigReceiver struct {
 	// back its results.
 	ScriptsClient scripts.Client
 
+	// PolicyEnforcer, when set, gates execution to scripts present in the git
+	// repository and always runs the content from git rather than from Fleet.
+	PolicyEnforcer scripts.PolicyEnforcer
+
 	// the dynamic scripts enabled check is done to check via mdm configuration
 	// profile if the host is allowed to run dynamic scripts. It is only done
 	// on macos and only if ScriptsExecutionEnabled is false.
@@ -307,12 +311,14 @@ type runScriptsConfigReceiver struct {
 
 func ApplyRunScriptsConfigFetcherMiddleware(
 	scriptsEnabled bool, scriptsClient scripts.Client, rootDirPath string,
+	policyEnforcer scripts.PolicyEnforcer,
 ) (fleet.OrbitConfigReceiver, func() bool) {
 	scriptsFetcher := &runScriptsConfigReceiver{
 		ScriptsExecutionEnabled:            scriptsEnabled,
 		ScriptsClient:                      scriptsClient,
 		dynamicScriptsEnabledCheckInterval: 5 * time.Minute,
 		rootDirPath:                        rootDirPath,
+		PolicyEnforcer:                     policyEnforcer,
 	}
 	// start the dynamic check for scripts enabled if required
 	scriptsFetcher.runDynamicScriptsEnabledCheck()
@@ -380,6 +386,7 @@ func (h *runScriptsConfigReceiver) Run(cfg *fleet.OrbitConfig) error {
 				ScriptExecutionEnabled: h.scriptsEnabled(),
 				Client:                 h.ScriptsClient,
 				ScriptExecutionTimeout: timeout,
+				PolicyEnforcer:         h.PolicyEnforcer,
 			}
 			fn := runner.Run
 			if h.runScriptsFn != nil {

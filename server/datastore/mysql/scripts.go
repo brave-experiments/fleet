@@ -402,11 +402,14 @@ func (ds *Datastore) getHostScriptExecutionResultDB(ctx context.Context, q sqlx.
 		hsr.setup_experience_script_id,
 		hsr.canceled,
 		bahr.batch_execution_id,
-		hsr.attempt_number
+		hsr.attempt_number,
+		COALESCE(s.name, '') as script_name
 	FROM
 		host_script_results hsr
 	LEFT JOIN
 		batch_activity_host_results bahr ON hsr.execution_id = bahr.host_execution_id
+	LEFT JOIN
+		scripts s ON hsr.script_id = s.id
 	JOIN
 		script_contents sc
 	%s
@@ -436,7 +439,8 @@ func (ds *Datastore) getHostScriptExecutionResultDB(ctx context.Context, q sqlx.
 		sua.setup_experience_script_id,
 		0 as canceled,
 		NULL as batch_execution_id,
-		NULL as attempt_number
+		NULL as attempt_number,
+		COALESCE(s.name, '') as script_name
   FROM
 		upcoming_activities ua
 		INNER JOIN script_upcoming_activities sua
@@ -444,6 +448,8 @@ func (ds *Datastore) getHostScriptExecutionResultDB(ctx context.Context, q sqlx.
 		INNER JOIN
 			script_contents sc
 			ON sua.script_content_id = sc.id
+		LEFT JOIN
+			scripts s ON sua.script_id = s.id
 	WHERE
 		ua.execution_id = ? AND
 		ua.activity_type = 'script'
