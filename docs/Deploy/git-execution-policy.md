@@ -16,8 +16,10 @@ The threat model this covers:
 
 The threat model this does **not** cover on its own (see [Additional hardening](#additional-hardening)):
 
-- Arbitrary **osquery distributed queries** sent by the server (data-exfiltration risk)
 - Software installer scripts (a separate execution path not yet covered by this policy)
+- MDM command execution (handled outside orbit)
+
+When the policy is enabled, orbit also automatically forces `--disable_distributed=true` into the osquery flag file on every config refresh, blocking arbitrary live/distributed osquery queries that would otherwise bypass orbit and talk to the Fleet server directly. The Fleet server cannot re-enable distributed queries while the policy is active.
 
 ## How it works
 
@@ -117,21 +119,13 @@ Delete the file from `scripts/` via a signed, reviewed commit. From that point o
 
 The git execution policy covers **named script execution** only. The following additional measures are needed for a fully hardened deployment.
 
-### Disable osquery distributed queries
+### Disable osquery distributed queries (enforced automatically)
 
-Fleet's live query feature (and policy evaluation) works through osquery's [distributed query protocol](https://osquery.readthedocs.io/en/stable/development/osquery-distributed/). This channel operates directly between osqueryd and the Fleet server — orbit is not in the path and cannot gate it. A compromised server could use distributed queries to exfiltrate arbitrary data from hosts even if the git script policy is fully enforced.
+Fleet's live query feature (and policy evaluation) works through osquery's [distributed query protocol](https://osquery.readthedocs.io/en/stable/development/osquery-distributed/). This channel operates directly between osqueryd and the Fleet server. A compromised server could use distributed queries to exfiltrate arbitrary data from hosts even if the git script policy is fully enforced.
 
-To close this channel, disable distributed queries in your Fleet agent options and rely solely on scheduled query packs managed through GitOps:
+When `--git-policy-repo-url` is set, orbit automatically writes `--disable_distributed=true` into its osquery flag file on every config refresh, regardless of what the Fleet server's agent options say. A compromised server cannot re-enable distributed queries while the policy is active.
 
-```yaml
-# fleet.yml (or the relevant team config)
-agent_options:
-  config:
-    options:
-      disable_distributed: true
-```
-
-**Trade-off:** Disabling distributed queries turns off the Fleet live query UI and policy automations that rely on distributed queries. Scheduled packs (committed to the GitOps repo) continue to work. Evaluate whether this trade-off is acceptable for your environment; high-security segments of your fleet (servers, privileged workstations) are the primary candidates.
+**Trade-off:** This turns off the Fleet live query UI and policy automations that rely on distributed queries for any host running with `--git-policy-repo-url` set. Scheduled query packs (committed to the GitOps repo) continue to work. Evaluate whether this trade-off is acceptable for your environment; high-security segments of your fleet (servers, privileged workstations) are the primary candidates.
 
 ### Restrict which scripts are uploaded to Fleet
 
@@ -170,7 +164,7 @@ The git policy is implemented in orbit itself. Ensure your orbit update channel 
 | Limitation | Notes |
 |------------|-------|
 | Software installer scripts | Install and post-install scripts run by Fleet's software management feature are not yet covered by the git policy. They go through a separate execution path in orbit. |
-| osquery distributed queries | Covered by disabling distributed queries in agent options (see above). |
+| osquery distributed queries | Disabled automatically by orbit when the policy is active (see above). |
 | MDM commands | MDM command execution (profiles, DDM) is not mediated by orbit and is not covered by this policy. |
 | Windows git requirement | `git` is not installed by default on Windows. It must be pre-installed or deployed via your MDM before orbit enrollment if you use this feature. |
 | Sync latency | Script changes become effective on a host after the next sync (default 5 minutes). Plan for this delay when deploying emergency remediations. |

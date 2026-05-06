@@ -30,6 +30,13 @@ type FlagRunner struct {
 type FlagUpdateOptions struct {
 	// RootDir is the root directory for orbit state
 	RootDir string
+	// ForceDisableDistributed, if true, forces --disable_distributed=true into
+	// the osquery flag file regardless of what the Fleet server sends, and
+	// guarantees the flag file is written even if the server provides no flags.
+	// Used by the git execution policy to prevent a compromised Fleet server
+	// from re-enabling live/distributed osquery queries (which would otherwise
+	// bypass orbit and the script policy entirely).
+	ForceDisableDistributed bool
 }
 
 // NewFlagRunner creates a new runner with provided options
@@ -57,14 +64,27 @@ func (r *FlagRunner) Run(config *fleet.OrbitConfig) error {
 		flagFileExists = false
 	}
 
-	if len(config.Flags) == 0 {
+	if len(config.Flags) == 0 && !r.opt.ForceDisableDistributed {
 		// command_line_flags not set in YAML, nothing to do
 		return nil
 	}
 
-	osqueryFlagMapFromFleet, err := getFlagsFromJSON(config.Flags)
-	if err != nil {
-		return fmt.Errorf("error parsing flags: %w", err)
+	var osqueryFlagMapFromFleet map[string]string
+	if len(config.Flags) > 0 {
+		osqueryFlagMapFromFleet, err = getFlagsFromJSON(config.Flags)
+		if err != nil {
+			return fmt.Errorf("error parsing flags: %w", err)
+		}
+	} else {
+		osqueryFlagMapFromFleet = make(map[string]string)
+	}
+
+	// When the git execution policy is active we hard-override
+	// --disable_distributed=true. This prevents a compromised Fleet server from
+	// re-enabling live/distributed osquery queries, which talk directly to Fleet
+	// and would bypass the script policy enforced elsewhere in orbit.
+	if r.opt.ForceDisableDistributed {
+		osqueryFlagMapFromFleet["--disable_distributed"] = "true"
 	}
 
 	// compare both flags, if they are equal, nothing to do

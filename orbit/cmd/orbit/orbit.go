@@ -1308,6 +1308,10 @@ func orbitAction(c *cli.Context) error {
 
 	flagUpdateReceiver := update.NewFlagReceiver(orbitClient.TriggerOrbitRestart, update.FlagUpdateOptions{
 		RootDir: c.String("root-dir"),
+		// When the git execution policy is enabled, force --disable_distributed=true
+		// so a compromised Fleet server cannot re-enable live/distributed osquery
+		// queries that bypass orbit's script policy.
+		ForceDisableDistributed: policyEnforcer != nil,
 	})
 	orbitClient.RegisterConfigReceiver(flagUpdateReceiver)
 
