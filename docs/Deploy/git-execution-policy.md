@@ -13,13 +13,13 @@ The threat model this covers:
 - A compromised Fleet server sending arbitrary script content
 - An administrator account being hijacked and used to create and run malicious scripts
 - Supply-chain attacks that modify scripts stored in Fleet's database
+- Live/distributed osquery queries used to exfiltrate data or trigger osquery-side execution (orbit forces `--disable_distributed=true` while the policy is active — see [Additional hardening](#additional-hardening))
 
-The threat model this does **not** cover on its own (see [Additional hardening](#additional-hardening)):
+The threat model this does **not** yet cover (see [Limitations](#limitations) and [the roadmap](git-execution-policy-roadmap.md) for the work in progress):
 
-- Software installer scripts (a separate execution path not yet covered by this policy)
-- MDM command execution (handled outside orbit)
-
-When the policy is enabled, orbit also automatically forces `--disable_distributed=true` into the osquery flag file on every config refresh, blocking arbitrary live/distributed osquery queries that would otherwise bypass orbit and talk to the Fleet server directly. The Fleet server cannot re-enable distributed queries while the policy is active.
+- Software installer scripts (install / post-install / uninstall) — a separate orbit execution path
+- osquery extensions and other osquery startup flags
+- MDM command execution (handled by the OS MDM stack, outside orbit's path)
 
 ## How it works
 
@@ -163,8 +163,8 @@ The git policy is implemented in orbit itself. Ensure your orbit update channel 
 
 | Limitation | Notes |
 |------------|-------|
-| Software installer scripts | Install and post-install scripts run by Fleet's software management feature are not yet covered by the git policy. They go through a separate execution path in orbit. |
-| osquery distributed queries | Disabled automatically by orbit when the policy is active (see above). |
-| MDM commands | MDM command execution (profiles, DDM) is not mediated by orbit and is not covered by this policy. |
+| Software installer scripts | Install / post-install / uninstall scripts run by Fleet's software management feature are not yet covered. Tracked in [the roadmap](git-execution-policy-roadmap.md#3-software-installer-scripts--todo). |
+| osquery extensions and startup flags | Extensions and dangerous osquery flags (`--extensions_autoload`, `--config_path`, etc.) are still server-controlled. Tracked in the [extensions](git-execution-policy-roadmap.md#5-osquery-extensions--todo) and [flags](git-execution-policy-roadmap.md#6-other-osquery-startup-flags--todo) sections of the roadmap. |
+| MDM commands | MDM command execution (profiles, DDM, MDM `ShellScript`) is not mediated by orbit. Mitigation requires either skipping MDM enrollment for high-security hosts or out-of-band server-side controls. See [the roadmap](git-execution-policy-roadmap.md#8-mdm-commands--out-of-scope-for-orbit). |
 | Windows git requirement | `git` is not installed by default on Windows. It must be pre-installed or deployed via your MDM before orbit enrollment if you use this feature. |
 | Sync latency | Script changes become effective on a host after the next sync (default 5 minutes). Plan for this delay when deploying emergency remediations. |
