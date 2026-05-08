@@ -12,13 +12,13 @@ This document inventories every server-controlled execution path that orbit (or 
 
 | # | Channel | Risk | Status | Side | Effort |
 |---|---|---|---|---|---|
-| 1 | Named scripts (`/orbit/scripts/request`) | Critical — direct shell exec as root | **Done** in this branch | Orbit + Fleet server | — |
-| 2 | osquery distributed queries | Critical — arbitrary SQL data exfil | **Done** in this branch | Orbit | — |
-| 3 | Software installer scripts (install / post-install / uninstall) | Critical — same as #1 via different endpoint | **TODO** | Orbit + Fleet server | Medium |
-| 4 | Setup experience scripts (DEP / Linux setup) | High — root exec at enrollment | **TODO** | Orbit + Fleet server | Small |
-| 5 | osquery extensions (`OrbitConfig.Extensions`) | High — native code in osquery process | **TODO** | Orbit | Small |
-| 6 | Other osquery `command_line_startup_flags` | Medium — `--extensions_autoload`, `--config_path`, `--watcher`, etc. | **TODO** | Orbit | Small |
-| 7 | TUF `UpdateChannels` (server-set) | Medium — channel pinning manipulation | **TODO** | Orbit | Small |
+| 1 | Named scripts (`/orbit/scripts/request`) | Critical — direct shell exec as root | **Done** | Orbit (+ small Fleet server payload change) | — |
+| 2 | osquery distributed queries | Critical — arbitrary SQL data exfil | **Done** | Orbit | — |
+| 3 | Software installer scripts (install / post-install / uninstall) | Critical — same as #1 via different endpoint | **Done** | Orbit + small Fleet server payload change | — |
+| 4 | Setup experience scripts (DEP / Linux setup) | High — root exec at enrollment | **Done** | Fleet server (SQL JOIN extension; orbit-side flow reused) | — |
+| 5 | osquery extensions (`OrbitConfig.Extensions`) | High — native code in osquery process | **Done** | Orbit | — |
+| 6 | Other osquery `command_line_startup_flags` | Medium — `--extensions_autoload`, `--config_path`, `--watcher`, etc. | **Done** | Orbit | — |
+| 7 | TUF `UpdateChannels` (server-set) | Medium — channel pinning manipulation | **Done** | Orbit | — |
 | 8 | Apple/Windows MDM commands | High — outside orbit, separate channel | **Out of scope for orbit** | Fleet server / device MDM stack | Large |
 | 9 | Nudge configuration | Low — UI manipulation, no code exec | Acceptable | — | — |
 | 10 | Setup-experience SSO browser open | Low — sandboxed web content | Acceptable | — | — |
@@ -33,9 +33,9 @@ This document inventories every server-controlled execution path that orbit (or 
 
 **Mitigation in this branch:**
 
-- **Fleet server** now returns `script_name` alongside `script_contents` so orbit can identify the script by a stable name.
-  - `server/fleet/scripts.go` — added `ScriptName string` field on `HostScriptResult`
-  - `server/datastore/mysql/scripts.go` — `LEFT JOIN scripts s ON ... s.name AS script_name` on `getActiveStmt` and `getUpcomingStmt`
+- **Fleet server** returns `script_name` alongside `script_contents` so orbit can identify the script by a stable name. This is a tiny payload-surface change, not a logic change — the Fleet server already loads `scriptName` from the database (see `server/service/orbit.go:987-1003`), it just wasn't passing it back to orbit.
+  - `server/fleet/scripts.go` — added `ScriptName string` field on `HostScriptResult` (4 LOC)
+  - `server/datastore/mysql/scripts.go` — `LEFT JOIN scripts s ON ... s.name AS script_name` on the active and upcoming statements (~10 LOC)
 - **Orbit** clones a configured git repository on startup, indexes `scripts/*.sh|.ps1|.py`, and looks each pending script up by name. Runs the git version, blocks if absent, blocks anonymous scripts.
   - `orbit/pkg/gitpolicy/gitpolicy.go` (new)
   - `orbit/pkg/scripts/scripts.go` — `PolicyEnforcer` interface + check in `runOne()`
@@ -45,6 +45,16 @@ This document inventories every server-controlled execution path that orbit (or 
 - **Documentation:** `docs/Deploy/git-execution-policy.md`
 
 **Remaining for this item:** unit tests for `gitpolicy` and `scripts.PolicyEnforcer` paths.
+
+### Why a Fleet server change at all?
+
+A pure-orbit approach is possible but has trade-offs:
+
+- **Hash-based allowlist** (orbit hashes `script_contents` and looks up SHA256 in git): zero Fleet server diff, but lets an attacker swap one approved script for another at execution time. Admin clicks "run collect-logs", attacker substitutes "wipe-disk" content (also approved, different hash → different file in git → different behavior). Git is no longer the source of truth for *which script runs* — only for *what set of contents are runnable at all*.
+- **Orbit fetches name out of band**: orbit could call a separate Fleet endpoint to look up a script's name by ID. Adds a round-trip and exposes the same data via a different API. Effectively the same change to Fleet's API surface, just split across two endpoints.
+- **Surface name on the existing payload** (chosen): adds one column to the response. Smallest possible diff. Lets orbit make a single binding decision: "the server says scripts/request returned execution X for script Y; my git checkout says Y is `<contents>`; I run that or nothing."
+
+The chosen approach treats the script *name* as the thing the admin meant to run, and treats the git repository as the canonical mapping from name → contents. That's what makes git the authoritative source rather than just an allowlist.
 
 ---
 
@@ -65,120 +75,88 @@ This document inventories every server-controlled execution path that orbit (or 
 
 ---
 
-## 3. Software installer scripts — TODO
+## 3. Software installer scripts — DONE
 
-**Server endpoint:** `POST /api/fleet/orbit/software/install/{install_uuid}`
+**Server endpoint:** `POST /api/fleet/orbit/software_install/details`
 
-**Threat:** the response payload contains three server-supplied scripts that orbit runs as root/SYSTEM:
+**Threat:** the response payload contains three server-supplied scripts that orbit runs as root/SYSTEM (`InstallScript`, `PostInstallScript`, `UninstallScript`). A compromised server can put arbitrary shell into any of these.
 
-- `InstallScript`
-- `PostInstallScript`
-- `UninstallScript`
+**Mitigation in this branch:**
 
-A compromised server can put arbitrary shell into any of these and orbit will execute it. **This is the single largest remaining gap** — the server simply marks malicious code as a "software install" instead of a "script run" and gets the same code execution.
+- **Fleet server** now returns `software_title` on the install details payload, sourced via `LEFT JOIN software_titles st ON si.title_id = st.id`.
+  - `server/fleet/software_installer.go` — `SoftwareTitle string` field on `SoftwareInstallDetails`
+  - `server/datastore/mysql/software_installers.go` — JOIN extension on both branches of the UNION query
+- **Orbit** resolves install/post-install/uninstall script content by software title against the git policy repository:
+  - Path convention: `scripts/installers/<title>/{install,post-install,uninstall}.{sh,ps1}`
+  - `orbit/pkg/installer/installer.go` — new `PolicyEnforcer` interface; `applyInstallerPolicy()` rewrites the three scripts in place or sets `ExitCodePolicyBlocked`
+  - `orbit/pkg/gitpolicy/gitpolicy.go` — extended with `GetApprovedInstallerScript(title, kind)` and an `installerScripts` index
+- **Block conditions** (any one of these returns `ExitCodePolicyBlocked` and aborts the install):
+  - `software_title` is empty in the server payload
+  - title not present under `scripts/installers/`
+  - server sent a post-install or uninstall script but git has none for that title (partial coverage is unsafe)
 
-**Required Fleet server changes:**
-
-- Surface a stable identity for each installer script. Software titles in Fleet have IDs and titles already; the cleanest approach is to expose `software_title` (or the existing software installer record name) on the install payload so orbit can look it up in git.
-- Endpoint: probably `server/service/orbit_software_install.go` or similar (verify location).
-
-**Required orbit changes:**
-
-- Restore the `PolicyEnforcer` plumbing in `orbit/pkg/installer/installer.go` (was reverted earlier in this branch's history).
-- Look up each of the three scripts in git by a deterministic naming convention. Recommended:
-  ```
-  scripts/installers/<title>/install.sh
-  scripts/installers/<title>/post-install.sh
-  scripts/installers/<title>/uninstall.sh
-  ```
-- If any script is referenced in the server payload but missing from git, refuse the install and report `ExitCodePolicyBlocked`. If the server sends content but git has none for that title, block.
-
-**Out of scope but worth noting:** the installer **binary** itself is also delivered via Fleet's CDN/storage. A compromised server could ship a malicious .pkg/.msi/.deb. Mitigation options:
-- Pin SHA256 of approved installers in the git repo (`scripts/installers/<title>/installer.sha256`).
-- Verify after download, before running install.sh.
-
-**Effort:** medium. Around 200-300 lines of orbit changes plus Fleet-side endpoint surfacing the title. Tests for both sides.
+**Out of scope:** the installer **binary** itself is still served from Fleet's CDN. A compromised server could ship a malicious .pkg/.msi/.deb. To close this gap, future work could add `scripts/installers/<title>/installer.sha256` and verify after download.
 
 ---
 
-## 4. Setup experience scripts — TODO
+## 4. Setup experience scripts — DONE
 
-**Server endpoint:** `POST /api/fleet/orbit/setup_experience/status` (macOS DEP, Linux setup) returns scripts to run as part of host onboarding.
+**Server endpoint:** `POST /api/fleet/orbit/scripts/request` (setup-experience scripts reuse the same endpoint as regular scripts, distinguished by `setup_experience_script_id` instead of `script_id`).
 
-**Threat:** root exec at enrollment time, before any user is logged in. Same compromise vector as #3.
+**Threat:** root exec at enrollment time, before any user is logged in. Same compromise vector as #1 via a different SQL row.
 
-**Required Fleet server changes:**
+**Mitigation in this branch:**
 
-- Same as #3: expose a stable name for each setup-experience step so orbit can resolve it in git.
-
-**Required orbit changes:**
-
-- `orbit/pkg/setup_experience/setup_experience.go` — currently runs `payload.Script` content directly. Add the same `PolicyEnforcer` check before execution.
-- Naming convention: `scripts/setup-experience/<step-name>.sh`.
-
-**Alternative simpler mitigation:** when the policy is active, **always** block setup-experience scripts — these are typically rare and can be replicated by a normal post-enrollment scheduled script. This avoids the need to surface a name from the server side and trades a minor feature loss for a smaller diff.
-
-**Effort:** small (1–2 hours) if we use the simpler "always block" path; small-medium if we keep parity with #3.
+- **Fleet server** SQL (`server/datastore/mysql/scripts.go`) now resolves `script_name` from either the regular `scripts` table or the `setup_experience_scripts` table via `COALESCE(s.name, ses.name, '')` and a second `LEFT JOIN`. With the name surfaced, the existing orbit-side script policy enforcer (#1) handles setup-experience executions identically — no orbit-side changes needed.
+- Setup-experience scripts must therefore be committed to the same `scripts/` directory as regular scripts. The filename in the policy repository must match the name in `setup_experience_scripts.name`.
 
 ---
 
-## 5. osquery extensions — TODO
+## 5. osquery extensions — DONE
 
-**Server-controlled field:** `OrbitConfig.Extensions` (`json.RawMessage`) — server sends a JSON object naming extensions to load, with per-extension `platform` and `channel`.
+**Server-controlled field:** `OrbitConfig.Extensions` — server lists extensions to load with per-extension platform and channel.
 
-**Threat:** osquery extensions are arbitrary native binaries (`.ext` / `.ext.exe`) loaded into the osquery process. They can register tables that execute code, run subprocesses, exfiltrate, etc.
+**Threat:** osquery extensions are arbitrary native binaries loaded into the osquery process. The TUF signing requirement limits the blast radius (a binary must be TUF-signed) but a compromised server can still pick which TUF-signed extensions to load on which hosts.
 
-**Already partially mitigated:** extensions are downloaded from the TUF metadata server and the binary is signature-verified. **But** the *list of which extensions to load* is server-controlled, and the `channel` field is server-controlled. A compromised server can:
-- Switch any host to a malicious-but-TUF-signed extension (if such a thing exists in your TUF repo).
-- Pin a host to an old extension channel with a known vulnerability.
+**Mitigation in this branch:**
 
-**Required orbit changes:**
-
-- When `--git-policy-repo-url` is set, read `extensions.allowlist` from the policy repo (a YAML/JSON list of allowed extension names and pinned channels).
-- In `orbit/pkg/update/flag_runner.go` (`ExtensionRunner.Run`): filter the server's `Extensions` map to only entries in the allowlist; ignore the server-supplied `channel` and use the channel from git.
-- If the allowlist is empty or absent, refuse to load any extensions.
-
-**Effort:** small. ~100 LOC + tests.
+- **Orbit** reads `extensions.allowlist` (one extension name per line, `#` comments allowed) from the policy repository root.
+  - `orbit/pkg/gitpolicy/gitpolicy.go` — new `AllowedExtensions()` accessor; allowlist re-loaded on every git sync
+  - `orbit/pkg/update/flag_runner.go` — `ExtensionRunner.Run` consults the callback; extensions not in the set are dropped before any TUF metadata fetch or `extensions.load` write
+- A missing `extensions.allowlist` file is treated as an empty (non-nil) set — i.e. **no extensions allowed**. This is the safe default if the file is forgotten when migrating to the policy.
 
 ---
 
-## 6. Other osquery startup flags — TODO
+## 6. Other osquery startup flags — DONE
 
-**Server-controlled field:** `OrbitConfig.Flags` (the same `command_line_startup_flags` we already partially handle).
+**Server-controlled field:** `OrbitConfig.Flags` (the same `command_line_startup_flags` we partially handled in #2).
 
 **Threat:** osquery has many flags that change its execution behavior. Particularly dangerous if attacker-controlled:
 
-- `--extensions_autoload=<file>` — points osquery at an arbitrary file listing extensions to load (bypasses #5)
-- `--extensions_default_index=false` + path manipulation — similar bypass
-- `--config_path=<file>` — read config from a different file (could re-enable distributed)
-- `--watcher_*` — disable osquery watchdog
-- `--audit_*` — turn off audit logging
-- `--logger_path=<file>` — redirect logs (impedes detection)
-- Anything starting with `--enable_` / `--disable_` — toggling features off
+- `--extensions_autoload`, `--extensions_default_index` — bypass the extensions allowlist (#5)
+- `--config_path`, `--config_plugin` — re-read config from an attacker-controlled path
+- `--watcher_*`, `--disable_watchdog` — disable osquery's process watchdog
+- `--audit_*`, `--disable_audit` — turn off audit logging
+- `--logger_path` — redirect logs to attacker-controlled paths
+- `--enable_extensions_watchdog` — toggle extension behavior
 
-Fleet's server-side validation (`server/fleet/agent_options.go:88-95`) blocks `--host_identifier` and `--extensions_autoload`, but a *compromised* server bypasses its own validator.
+**Mitigation in this branch:**
 
-**Required orbit changes:**
-
-- When the policy is active, apply an orbit-side **allowlist** of safe flag prefixes/names. Anything not on the list is silently dropped before being written to `osquery.flags`.
-- Place the allowlist in `orbit/pkg/update/flag_runner.go` next to the existing `getFlagsFromJSON` logic.
-
-**Effort:** small. ~50 LOC + a test that asserts dangerous flags are dropped.
+- **Orbit** maintains a denylist of dangerous prefixes in `orbit/pkg/update/flag_runner.go` (`dangerousFlagPrefixes`). When the policy is active (`PolicyActive: true`), each flag the server sent is checked via `isDangerousFlag()`; matches are dropped with a warning log before the flag file is written.
+- Same `PolicyActive` knob also enforces `--disable_distributed=true` (item #2). Both behaviors are tied to the umbrella signal `policyEnforcer != nil` in `orbit.go`.
 
 ---
 
-## 7. TUF update channels — TODO
+## 7. TUF update channels — DONE
 
-**Server-controlled field:** `OrbitConfig.UpdateChannels` (server tells orbit which TUF channel to use for orbit/osqueryd/desktop binaries).
+**Server-controlled field:** `OrbitConfig.UpdateChannels` — server tells orbit which TUF channel to use for orbit/osqueryd/desktop binaries.
 
-**Threat:** server flips a host to a malicious-but-TUF-signed channel. TUF signing limits the blast radius — the attacker has to publish a malicious binary through the TUF infrastructure, which is signed separately. But the server can at minimum pin hosts to old/vulnerable channel versions.
+**Threat:** server flips a host to a malicious-but-TUF-signed channel, or pins to an old/vulnerable channel.
 
-**Required orbit changes:**
+**Mitigation in this branch:**
 
-- When the policy is active, ignore server-sent `UpdateChannels` and use either compile-time defaults or values from a `update-channels.yaml` in the policy repo.
-- Implementation: gate the existing channel-application logic in `orbit/pkg/update/` on `policyEnforcer == nil`.
-
-**Effort:** small. ~30 LOC + test.
+- **Orbit's** `serverOverridesRunner` (`orbit/cmd/orbit/orbit.go`) gains a `policyActive` flag. When set, `Run()` returns early before any channel comparison, leaving update channels at their compile-time defaults (typically `stable`).
+- A compromised server cannot influence channel selection while the policy is in effect.
 
 ---
 
@@ -219,53 +197,45 @@ These flow directly between the host MDM stack and the Fleet server — **orbit 
 
 ---
 
-## Recommended implementation order
+## Implementation status
 
-1. **#3 Software installer scripts** — biggest remaining hole, well-understood, parallel to #1
-2. **#4 Setup experience** — small effort, finishes orbit-mediated script paths
-3. **#6 Osquery flag allowlist** — small but closes the `--extensions_autoload` bypass that would otherwise defeat #5
-4. **#5 Extensions allowlist** — depends on #6 to be airtight
-5. **#7 Update channel override** — smallest, lowest priority
-
-After items 1–5 are complete, orbit has full coverage of every code-delivery path it controls. Item 8 (MDM) requires a separate workstream.
+Items 1–7 are now complete in this branch. Orbit has full coverage of every code-delivery path it controls. Item 8 (MDM) requires a separate workstream and is out of scope for orbit-side changes.
 
 ---
 
 ## Per-side change summary
 
-### Fleet server changes (so far + planned)
+### Fleet server changes
 
-| File | Status | Purpose |
+| File | Item | Purpose |
 |---|---|---|
-| `server/fleet/scripts.go` | Done | Add `ScriptName` to `HostScriptResult` |
-| `server/datastore/mysql/scripts.go` | Done | `LEFT JOIN scripts` to populate name |
-| `server/fleet/software_installer.go` | Done | Add `ExitCodePolicyBlocked = -4` |
-| `server/service/orbit_software_install.go` (or wherever installer payloads are built) | TODO #3 | Surface software title on install payload |
-| `server/service/orbit_setup_experience.go` (or wherever) | TODO #4 | Surface step name on setup-experience payload |
+| `server/fleet/scripts.go` | #1 | Add `ScriptName` field to `HostScriptResult` |
+| `server/datastore/mysql/scripts.go` | #1, #4 | `LEFT JOIN scripts` and `setup_experience_scripts` to populate name (`COALESCE(s.name, ses.name, '')`) |
+| `server/fleet/software_installer.go` | #1, #3 | Add `ExitCodePolicyBlocked = -4`, output copy, and `SoftwareTitle` field on `SoftwareInstallDetails` |
+| `server/datastore/mysql/software_installers.go` | #3 | `LEFT JOIN software_titles` to populate `software_title` on both UNION branches |
 
 The Fleet server changes are deliberately small and additive — they only **expose more identity information** on payloads orbit already receives. They do not change auth, RBAC, or any existing code path. This makes them suitable for upstream submission without a security review of new server-side logic.
 
-### Orbit changes (so far + planned)
+### Orbit changes
 
-| File | Status | Purpose |
+| File | Item | Purpose |
 |---|---|---|
-| `orbit/pkg/gitpolicy/gitpolicy.go` | Done | Git clone/index of approved scripts |
-| `orbit/pkg/scripts/scripts.go` | Done | Block named-script execution if not in git |
-| `orbit/pkg/update/notifications.go` | Done | Wire enforcer into the script runner |
-| `orbit/pkg/update/flag_runner.go` | Done | Force `disable_distributed=true` |
-| `orbit/cmd/orbit/orbit.go` | Done | New CLI flags |
-| `orbit/pkg/installer/installer.go` | TODO #3 | Block installer scripts not in git |
-| `orbit/pkg/setup_experience/setup_experience.go` | TODO #4 | Block setup-experience scripts not in git |
-| `orbit/pkg/update/flag_runner.go` (extensions section) | TODO #5 | Allowlist osquery extensions |
-| `orbit/pkg/update/flag_runner.go` (flag map section) | TODO #6 | Drop dangerous startup flags |
-| `orbit/pkg/update/` (channels) | TODO #7 | Ignore server-set update channels |
+| `orbit/pkg/gitpolicy/gitpolicy.go` | #1, #3, #5 | Git clone/index for scripts, installer scripts, and extension allowlist |
+| `orbit/pkg/gitpolicy/gitpolicy_test.go` | #1, #3, #5 | Indexing unit tests |
+| `orbit/pkg/scripts/scripts.go` | #1, #4 | Block named-script execution (regular + setup-experience) if not in git |
+| `orbit/pkg/update/notifications.go` | #1 | Wire enforcer into the script runner |
+| `orbit/pkg/update/flag_runner.go` | #2, #5, #6 | Force `disable_distributed=true`; drop dangerous flag denylist; filter extensions by allowlist |
+| `orbit/pkg/update/flag_runner_test.go` | #2, #6 | Unit tests for forced `disable_distributed` and dangerous-flag drop |
+| `orbit/pkg/installer/installer.go` | #3 | `PolicyEnforcer` interface; replace install / post-install / uninstall scripts with git versions or block |
+| `orbit/pkg/installer/installer_test.go` | #3 | Unit tests for `applyInstallerPolicy()` |
+| `orbit/cmd/orbit/orbit.go` | #1, #2, #5, #6, #7 | New CLI flags; wire `policyEnforcer` into flag runner, extension runner, installer runner, and server-overrides runner |
 
 ### Documentation
 
 | File | Status |
 |---|---|
-| `docs/Deploy/git-execution-policy.md` | Done — covers #1, #2 |
-| `docs/Deploy/git-execution-policy.md` | TODO — extend for #3-#7 once implemented |
+| `docs/Deploy/git-execution-policy.md` | User-facing; updated to cover items #1–#7 |
+| `docs/Deploy/git-execution-policy-roadmap.md` | This file; design rationale and remaining MDM gap |
 
 ---
 
@@ -279,10 +249,11 @@ The Fleet team will likely have feedback on a few axes. Anticipated questions an
 - **Will this add a hard `git` dependency to orbit?** Only when the policy flag is set. We use the system `git` binary via `exec.CommandContext` to avoid pulling in a Go git library and to leverage existing credential helpers / SSH config on the host.
 - **Why force `disable_distributed` instead of letting admins set it?** Because the feature is meaningless if a compromised server can re-enable distributed queries — that defeats the entire policy.
 
-A clean PR for upstream should probably split into:
+A clean upstream submission should split into independently-reviewable PRs:
 
-1. **PR 1 (small, low-risk):** Fleet server change to expose `ScriptName` on `HostScriptResult`. Useful on its own for Fleet UI/audit-log purposes; doesn't depend on the rest.
-2. **PR 2 (medium):** orbit-side `gitpolicy` package + script policy enforcer + CLI flags + `disable_distributed` enforcement.
-3. **PR 3+:** items 3–7 as separate PRs each, since each is small and independently reviewable.
+1. **PR 1 (server, small):** expose `ScriptName` on `HostScriptResult` (#1, #4). Useful on its own for Fleet UI/audit-log purposes; the SQL join also covers setup-experience scripts. Does not depend on any orbit change.
+2. **PR 2 (server, small):** expose `SoftwareTitle` on `SoftwareInstallDetails` (#3). Same shape as PR 1: a column added to the response, populated via JOIN.
+3. **PR 3 (orbit, medium):** `gitpolicy` package + scripts/installer/extensions enforcement + new CLI flags. The umbrella PR that turns the server-side data into actual policy enforcement. Includes the `PolicyActive` knob in the flag runner (covers #2, #6) and the early-return in `serverOverridesRunner` (#7).
+4. **PR 4 (docs):** the user-facing `git-execution-policy.md` with operator instructions.
 
-This staging makes the security argument easier to evaluate at each step and reduces the risk that the whole thing stalls in review.
+PRs 1 and 2 are zero-impact for any operator who isn't using the policy: the new fields are simply unused by stock orbit. PR 3 gates all behavior changes on the new `--git-policy-repo-url` flag — when unset, orbit's behavior is byte-identical to today.

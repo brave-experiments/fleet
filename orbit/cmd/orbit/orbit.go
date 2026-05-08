@@ -1308,10 +1308,12 @@ func orbitAction(c *cli.Context) error {
 
 	flagUpdateReceiver := update.NewFlagReceiver(orbitClient.TriggerOrbitRestart, update.FlagUpdateOptions{
 		RootDir: c.String("root-dir"),
-		// When the git execution policy is enabled, force --disable_distributed=true
-		// so a compromised Fleet server cannot re-enable live/distributed osquery
-		// queries that bypass orbit's script policy.
-		ForceDisableDistributed: policyEnforcer != nil,
+		// When the git execution policy is enabled, the flag runner additionally
+		// forces --disable_distributed=true and drops a denylist of dangerous
+		// osquery startup flags (see flag_runner.go). This prevents a compromised
+		// Fleet server from re-enabling distributed queries or smuggling in
+		// flags like --extensions_autoload that bypass other policy layers.
+		PolicyActive: policyEnforcer != nil,
 	})
 	orbitClient.RegisterConfigReceiver(flagUpdateReceiver)
 
@@ -1323,6 +1325,7 @@ func orbitAction(c *cli.Context) error {
 				DesktopPath:  desktopPath,
 			},
 			c.Bool("fleet-desktop"),
+			policyEnforcer != nil,
 			orbitClient.TriggerOrbitRestart,
 		)
 
@@ -1333,8 +1336,24 @@ func orbitAction(c *cli.Context) error {
 	// for extensions autoupdate, we can only proceed after orbit is enrolled in fleet
 	// and all relevant things for it (like certs, enroll secrets, tls proxy, etc) is configured
 	if !c.Bool("disable-updates") || c.Bool("dev-mode") {
+		var allowedExtensionsFn func() map[string]struct{}
+		if policyEnforcer != nil {
+			// Git execution policy active: only load extensions whose names appear
+			// in extensions.allowlist in the policy repository. The callback
+			// re-reads on every config refresh so allowlist updates take effect
+			// within one git sync interval. A nil index (not yet loaded) is
+			// treated as "no extensions allowed".
+			allowedExtensionsFn = func() map[string]struct{} {
+				allowed := policyEnforcer.AllowedExtensions()
+				if allowed == nil {
+					return map[string]struct{}{}
+				}
+				return allowed
+			}
+		}
 		extRunner := update.NewExtensionConfigUpdateRunner(update.ExtensionUpdateOptions{
-			RootDir: c.String("root-dir"),
+			RootDir:           c.String("root-dir"),
+			AllowedExtensions: allowedExtensionsFn,
 		}, updateRunner, orbitClient.TriggerOrbitRestart)
 
 		// call UpdateAction on the updateRunner after we have fetched extensions from Fleet
@@ -1573,6 +1592,12 @@ func orbitAction(c *cli.Context) error {
 	}
 
 	softwareRunner := installer.NewRunner(orbitClient, r.ExtensionSocketPath(), scriptsEnabledFn, c.String("root-dir"))
+	if policyEnforcer != nil {
+		// Git execution policy is active: route install/post-install/uninstall
+		// scripts through the policy repository instead of trusting the Fleet
+		// server's payload.
+		softwareRunner.PolicyEnforcer = policyEnforcer
+	}
 	orbitClient.RegisterConfigReceiver(softwareRunner)
 
 	if runtime.GOOS == "darwin" {
@@ -2312,6 +2337,11 @@ type serverOverridesRunner struct {
 	desktopEnabled      bool
 	cancel              chan struct{}
 	triggerOrbitRestart func(reason string)
+	// policyActive, when true, indicates the git execution policy is in effect.
+	// In that mode we ignore server-supplied UpdateChannels: a compromised server
+	// could otherwise pin hosts to a vulnerable channel or flip them to a
+	// malicious-but-TUF-signed binary. Channels stay at their compile-time defaults.
+	policyActive bool
 }
 
 // newServerOverridesReveiver creates a runner for updating server overrides configuration with values fetched from Fleet.
@@ -2319,12 +2349,14 @@ func newServerOverridesReceiver(
 	rootDir string,
 	fallbackCfg fallbackServerOverridesConfig,
 	desktopEnabled bool,
+	policyActive bool,
 	triggerOrbitRestart func(reason string),
 ) *serverOverridesRunner {
 	return &serverOverridesRunner{
 		rootDir:             rootDir,
 		fallbackCfg:         fallbackCfg,
 		desktopEnabled:      desktopEnabled,
+		policyActive:        policyActive,
 		cancel:              make(chan struct{}),
 		triggerOrbitRestart: triggerOrbitRestart,
 	}
@@ -2334,6 +2366,14 @@ func (r *serverOverridesRunner) Run(orbitCfg *fleet.OrbitConfig) error {
 	overrideCfg, err := loadServerOverrides(r.rootDir)
 	if err != nil {
 		return err
+	}
+
+	if r.policyActive {
+		// Git execution policy is active: do not let the Fleet server change
+		// orbit/osqueryd/desktop update channels. Keeping the values at their
+		// compile-time defaults prevents a compromised server from pinning hosts
+		// to a vulnerable or attacker-chosen channel.
+		return nil
 	}
 
 	if orbitCfg.UpdateChannels == nil {

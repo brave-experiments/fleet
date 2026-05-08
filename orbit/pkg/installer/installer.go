@@ -48,6 +48,17 @@ type QueryClient interface {
 	QueryContext(context.Context, string) (*QueryResponse, error)
 }
 
+// PolicyEnforcer gates software-installer script execution against the git
+// repository. A nil enforcer means no policy is applied.
+type PolicyEnforcer interface {
+	// GetApprovedInstallerScript returns the approved content for the given
+	// software title and script kind ("install", "post-install", or
+	// "uninstall") from the git policy repository, or (nil, false) if no such
+	// approval exists. When found, callers must run that content rather than
+	// what the Fleet server sent, so that git is the authoritative source.
+	GetApprovedInstallerScript(title, kind string) ([]byte, bool)
+}
+
 type Runner struct {
 	OsqueryClient QueryClient
 	OrbitClient   Client
@@ -88,6 +99,11 @@ type Runner struct {
 	retryOpts []retry.Option
 
 	logger zerolog.Logger
+
+	// PolicyEnforcer, when non-nil, restricts install/post-install/uninstall
+	// scripts to versions stored in the git policy repository, keyed by the
+	// software title that the Fleet server reports.
+	PolicyEnforcer PolicyEnforcer
 }
 
 const extractionDirectoryName = "extracted"
@@ -251,6 +267,16 @@ func (r *Runner) installSoftware(ctx context.Context, installID string, logger z
 		return payload, nil
 	}
 
+	if r.PolicyEnforcer != nil {
+		if err := r.applyInstallerPolicy(installer, payload, logger); err != nil {
+			return payload, err
+		}
+		if payload.InstallScriptExitCode != nil {
+			// Policy blocked the install — payload is already populated.
+			return payload, nil
+		}
+	}
+
 	// Perform the installation with retry logic if MaxRetries > 0
 	if installer.MaxRetries > 0 {
 		logger.Info().Msgf("Installation configured with %d retries", installer.MaxRetries)
@@ -259,6 +285,63 @@ func (r *Runner) installSoftware(ctx context.Context, installID string, logger z
 
 	// No retries configured, perform single installation attempt
 	return r.attemptInstall(ctx, installer, payload, logger)
+}
+
+// applyInstallerPolicy enforces the git execution policy on the installer
+// scripts. When the policy is active, the install / post-install / uninstall
+// scripts are replaced with the contents from the git repository, keyed by the
+// software title; if any script the server provided is missing from git, the
+// install is blocked and payload.InstallScriptExitCode is set to
+// ExitCodePolicyBlocked. The caller must check that field before proceeding.
+func (r *Runner) applyInstallerPolicy(installer *fleet.SoftwareInstallDetails, payload *fleet.HostSoftwareInstallResultPayload, logger zerolog.Logger) error {
+	title := installer.SoftwareTitle
+	block := func(reason string) {
+		logger.Error().Str("title", title).Msg(reason)
+		payload.InstallScriptExitCode = ptr.Int(fleet.ExitCodePolicyBlocked)
+		payload.InstallScriptOutput = ptr.String(reason)
+	}
+
+	if title == "" {
+		block("Software install blocked by git execution policy: software title is missing")
+		return nil
+	}
+
+	// install (required)
+	content, found := r.PolicyEnforcer.GetApprovedInstallerScript(title, "install")
+	if !found {
+		block(fmt.Sprintf(
+			"Software install blocked by git execution policy: %q has no approved install script in the policy repository",
+			title))
+		return nil
+	}
+	installer.InstallScript = string(content)
+
+	// post-install (only enforce if the server is sending one)
+	if installer.PostInstallScript != "" {
+		content, found := r.PolicyEnforcer.GetApprovedInstallerScript(title, "post-install")
+		if !found {
+			block(fmt.Sprintf(
+				"Software install blocked by git execution policy: %q has no approved post-install script in the policy repository",
+				title))
+			return nil
+		}
+		installer.PostInstallScript = string(content)
+	}
+
+	// uninstall (used during rollback; require it whenever the server provided one)
+	if installer.UninstallScript != "" {
+		content, found := r.PolicyEnforcer.GetApprovedInstallerScript(title, "uninstall")
+		if !found {
+			block(fmt.Sprintf(
+				"Software install blocked by git execution policy: %q has no approved uninstall script in the policy repository",
+				title))
+			return nil
+		}
+		installer.UninstallScript = string(content)
+	}
+
+	logger.Info().Str("title", title).Msg("git policy: serving installer scripts from repository")
+	return nil
 }
 
 // installWithRetry attempts installation with retry logic for setup experience

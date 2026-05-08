@@ -1252,3 +1252,101 @@ func tempDirFn(t *testing.T) func(string, string) (string, error) {
 		return t.TempDir(), nil
 	}
 }
+
+// fakeInstallerPolicy is a PolicyEnforcer used in tests.
+type fakeInstallerPolicy struct {
+	scripts map[string]map[string][]byte // title → kind → contents
+}
+
+func (f *fakeInstallerPolicy) GetApprovedInstallerScript(title, kind string) ([]byte, bool) {
+	if f.scripts == nil {
+		return nil, false
+	}
+	t, ok := f.scripts[title]
+	if !ok {
+		return nil, false
+	}
+	c, ok := t[kind]
+	return c, ok
+}
+
+// TestApplyInstallerPolicyApproved verifies that when the policy has an
+// approved install script for the title, server-supplied content is replaced.
+func TestApplyInstallerPolicyApproved(t *testing.T) {
+	t.Parallel()
+	r := &Runner{
+		PolicyEnforcer: &fakeInstallerPolicy{
+			scripts: map[string]map[string][]byte{
+				"Slack": {
+					"install":      []byte("# git install\n"),
+					"post-install": []byte("# git post\n"),
+				},
+			},
+		},
+	}
+	installer := &fleet.SoftwareInstallDetails{
+		SoftwareTitle:     "Slack",
+		InstallScript:     "rm -rf / # from compromised server",
+		PostInstallScript: "echo 'evil'",
+	}
+	payload := &fleet.HostSoftwareInstallResultPayload{}
+	require.NoError(t, r.applyInstallerPolicy(installer, payload, log.Logger))
+
+	require.Nil(t, payload.InstallScriptExitCode, "approved install must not block")
+	require.Equal(t, "# git install\n", installer.InstallScript)
+	require.Equal(t, "# git post\n", installer.PostInstallScript)
+}
+
+// TestApplyInstallerPolicyMissing verifies that a title not present in the
+// policy repository is blocked with the policy exit code.
+func TestApplyInstallerPolicyMissing(t *testing.T) {
+	t.Parallel()
+	r := &Runner{PolicyEnforcer: &fakeInstallerPolicy{}}
+	installer := &fleet.SoftwareInstallDetails{
+		SoftwareTitle: "EvilApp",
+		InstallScript: "rm -rf /",
+	}
+	payload := &fleet.HostSoftwareInstallResultPayload{}
+	require.NoError(t, r.applyInstallerPolicy(installer, payload, log.Logger))
+
+	require.NotNil(t, payload.InstallScriptExitCode)
+	require.Equal(t, fleet.ExitCodePolicyBlocked, *payload.InstallScriptExitCode)
+	require.Contains(t, *payload.InstallScriptOutput, "EvilApp")
+}
+
+// TestApplyInstallerPolicyEmptyTitle verifies that an installer with no
+// software title is blocked (cannot be looked up).
+func TestApplyInstallerPolicyEmptyTitle(t *testing.T) {
+	t.Parallel()
+	r := &Runner{PolicyEnforcer: &fakeInstallerPolicy{}}
+	installer := &fleet.SoftwareInstallDetails{InstallScript: "echo hi"}
+	payload := &fleet.HostSoftwareInstallResultPayload{}
+	require.NoError(t, r.applyInstallerPolicy(installer, payload, log.Logger))
+
+	require.NotNil(t, payload.InstallScriptExitCode)
+	require.Equal(t, fleet.ExitCodePolicyBlocked, *payload.InstallScriptExitCode)
+}
+
+// TestApplyInstallerPolicyPartialMissing verifies that having an install but
+// not a post-install script in git, when the server sent a post-install,
+// is treated as a block — partial coverage is unsafe.
+func TestApplyInstallerPolicyPartialMissing(t *testing.T) {
+	t.Parallel()
+	r := &Runner{
+		PolicyEnforcer: &fakeInstallerPolicy{
+			scripts: map[string]map[string][]byte{
+				"Slack": {"install": []byte("# git install")},
+			},
+		},
+	}
+	installer := &fleet.SoftwareInstallDetails{
+		SoftwareTitle:     "Slack",
+		InstallScript:     "evil",
+		PostInstallScript: "evil-post",
+	}
+	payload := &fleet.HostSoftwareInstallResultPayload{}
+	require.NoError(t, r.applyInstallerPolicy(installer, payload, log.Logger))
+
+	require.NotNil(t, payload.InstallScriptExitCode)
+	require.Equal(t, fleet.ExitCodePolicyBlocked, *payload.InstallScriptExitCode)
+}

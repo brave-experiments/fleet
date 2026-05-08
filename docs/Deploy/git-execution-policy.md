@@ -10,33 +10,69 @@ The git execution policy addresses this by making the git repository — not the
 
 The threat model this covers:
 
-- A compromised Fleet server sending arbitrary script content
+- A compromised Fleet server sending arbitrary script content (named scripts, setup-experience scripts, software install / post-install / uninstall scripts)
 - An administrator account being hijacked and used to create and run malicious scripts
 - Supply-chain attacks that modify scripts stored in Fleet's database
-- Live/distributed osquery queries used to exfiltrate data or trigger osquery-side execution (orbit forces `--disable_distributed=true` while the policy is active — see [Additional hardening](#additional-hardening))
+- Live/distributed osquery queries used to exfiltrate data or trigger osquery-side execution (orbit forces `--disable_distributed=true` while the policy is active)
+- Server-side attempts to load arbitrary osquery extensions or pin dangerous startup flags (`--extensions_autoload`, `--config_path`, `--watcher_*`, `--audit_*`, etc.)
+- Server-side attempts to flip orbit/osqueryd/desktop to a different TUF update channel
 
-The threat model this does **not** yet cover (see [Limitations](#limitations) and [the roadmap](git-execution-policy-roadmap.md) for the work in progress):
+The threat model this does **not** cover (see [Limitations](#limitations) and [the roadmap](git-execution-policy-roadmap.md)):
 
-- Software installer scripts (install / post-install / uninstall) — a separate orbit execution path
-- osquery extensions and other osquery startup flags
-- MDM command execution (handled by the OS MDM stack, outside orbit's path)
+- MDM commands (Apple/Windows/Linux MDM stacks talk directly to Fleet — orbit is not in the path)
+- Software installer **binaries** (the .pkg/.msi/.deb itself is still served from Fleet's CDN; only the install / post-install / uninstall scripts are gated)
 
 ## How it works
 
-When `--git-policy-repo-url` is set, orbit does the following on startup and then periodically:
+When `--git-policy-repo-url` is set, orbit clones the configured git repository on startup and re-syncs it on the configured interval. The local index covers four things:
 
-1. Clones (or pulls) the configured git repository to a local directory on the host.
-2. Walks the `scripts/` subdirectory (configurable) and indexes every `.sh`, `.ps1`, and `.py` file by its basename.
+| Index | Source in repo | Purpose |
+|---|---|---|
+| Scripts | `scripts/*.{sh,ps1,py}` | Named scripts and setup-experience scripts |
+| Installer scripts | `scripts/installers/<title>/{install,post-install,uninstall}.{sh,ps1}` | Software install / post-install / uninstall scripts, keyed by software title |
+| Extensions allowlist | `extensions.allowlist` (one name per line) | Which osquery extensions orbit will load |
+| (none — hardcoded) | n/a | Denylist of dangerous osquery startup flags |
+
+### Named scripts and setup-experience scripts
 
 When the Fleet server sends a pending script execution:
 
 1. Orbit fetches the execution details from Fleet, which includes the **script name** (e.g. `collect-logs.sh`).
-2. Orbit looks up that name in its local git index.
+2. Orbit looks up that name in `scripts/`.
 3. If found: orbit executes the content **from git** — the server-provided content is discarded entirely.
 4. If not found: orbit reports the execution as blocked (exit code `-4`) back to Fleet without running anything.
 5. If the script has no name (an ad-hoc / anonymous run): orbit always blocks it.
 
-Because the git repository is the source of truth, commit signing and branch protection rules on the repository are the actual access control boundary. A compromised Fleet server can name a script to run, but cannot change what that script does.
+Setup-experience scripts go through the same path — the Fleet server surfaces their name from the `setup_experience_scripts` table.
+
+### Software installer scripts
+
+When the Fleet server sends a pending software install:
+
+1. Orbit fetches the install details, which include the **software title** (e.g. `Slack`).
+2. Orbit looks up `scripts/installers/<title>/install.<ext>` in git and uses that as the install script.
+3. If the server payload also contains a post-install or uninstall script, orbit looks for the corresponding file in git. **All scripts the server sent must have a git-side counterpart**; partial coverage blocks the install.
+4. The install proceeds with the git scripts. The Fleet-supplied installer **binary** is still downloaded and executed (see [Limitations](#limitations)).
+5. If anything is missing from git, orbit reports the install as blocked with exit code `-4`.
+
+### osquery extensions
+
+On every config refresh, orbit takes the server's list of extensions to load and drops any whose name is not in `extensions.allowlist`. A missing allowlist file is treated as **no extensions allowed** — the safe default.
+
+### osquery startup flags
+
+When the policy is active, orbit additionally enforces two flag-runner behaviors:
+
+- `--disable_distributed=true` is written to `osquery.flags` regardless of what the server sent. A compromised server cannot re-enable live/distributed queries.
+- A denylist of dangerous flags is dropped before being written: `--extensions_autoload`, `--extensions_default_index`, `--config_path`, `--config_plugin`, `--watcher_*`, `--audit_*`, `--disable_watchdog`, `--disable_audit`, `--logger_path`, `--enable_extensions_watchdog`.
+
+### Update channels
+
+When the policy is active, orbit ignores the server's `update_channels` field and keeps orbit/osqueryd/desktop on their compile-time default channels (typically `stable`).
+
+### Why this is sufficient
+
+Because the git repository is the source of truth, commit signing and branch protection rules on the repository are the actual access control boundary. A compromised Fleet server can name a script to run, but cannot change what that script does, what extensions get loaded, what osquery flags get set, or which update channel orbit follows.
 
 ## Requirements
 
@@ -79,53 +115,65 @@ If the repository requires authentication (private repo), configure git credenti
 
 ## Repository structure
 
-The policy repository can be your existing Fleet GitOps repository or a dedicated one. The only requirement is a directory of approved scripts:
+The policy repository can be your existing Fleet GitOps repository or a dedicated one. The full layout it can support:
 
 ```
 fleet-gitops/
-├── fleet.yml               # existing GitOps config
-├── scripts/                # approved scripts (name must match what's in Fleet)
-│   ├── collect-logs.sh
-│   ├── remediate-defender.ps1
-│   └── check-compliance.py
-└── ...
+├── fleet.yml                              # existing GitOps config (optional)
+├── extensions.allowlist                   # one extension name per line; "#" comments OK
+└── scripts/
+    ├── collect-logs.sh                    # named script
+    ├── remediate-defender.ps1             # named script
+    ├── enroll-step.sh                     # setup-experience script (must match the
+    │                                      # name in Fleet's setup_experience_scripts table)
+    └── installers/
+        ├── Slack/
+        │   ├── install.sh
+        │   ├── post-install.sh
+        │   └── uninstall.sh
+        └── Chrome/
+            └── install.ps1
 ```
 
-Script filenames in this directory must exactly match the script names registered in Fleet (the filename used when the script was uploaded via GitOps or the UI). Orbit matches by basename only — subdirectory structure within `scripts/` is ignored during lookup.
+- **Scripts**: filenames must exactly match the names registered in Fleet (regular `scripts.name` or `setup_experience_scripts.name`). Orbit matches by basename — subdirectory structure within `scripts/` (other than `installers/`) is ignored.
+- **Installer scripts**: directory name must match the **software title** as Fleet records it (e.g. `Slack`, not `slack-4.42.117.pkg`). The kind (`install`, `post-install`, `uninstall`) is taken from the filename minus its extension.
+- **Extensions allowlist**: lines starting with `#` and blank lines are ignored. A missing file is treated as **no extensions allowed**.
 
-### Adding or updating a script
+### Adding or updating an entry
 
-1. Add or edit the file in `scripts/` on a feature branch.
+1. Add or edit the file on a feature branch.
 2. Open a pull request. Reviewers approve and the commit is signed.
 3. Merge to the tracked branch.
 4. Within one sync interval (default 5 minutes), orbit picks up the change.
 
-### Removing a script
+### Removing an entry
 
-Delete the file from `scripts/` via a signed, reviewed commit. From that point on, any Fleet-triggered execution of that script name will be blocked on all hosts that have synced.
+Delete the file via a signed, reviewed commit. From the next sync onward, any Fleet-triggered execution that depended on that entry is blocked on all hosts.
 
 ## Behavior reference
 
 | Situation | Orbit action |
 |-----------|-------------|
-| Script name found in git | Execute the **git version** of the script, regardless of content Fleet sent |
-| Script name not found in git | Report blocked (exit `-4`, message shown in Fleet UI) |
+| Named script found in git | Execute the **git version**, regardless of content Fleet sent |
+| Named script not found in git | Report blocked (exit `-4`, message in Fleet UI) |
 | Script has no name (ad-hoc run) | Always blocked |
+| Software install with all required scripts in git | Replace install / post-install / uninstall content with git versions and proceed |
+| Software install with `software_title` empty or missing from git | Block (exit `-4`); installer binary is not downloaded |
+| Software install where server sent post-install/uninstall but git has none | Block — partial coverage is treated as unsafe |
+| osquery extension in server config but not in `extensions.allowlist` | Drop before `extensions.load` is written; osquery never sees it |
+| Server sends `--extensions_autoload`, `--config_path`, `--watcher_*`, `--audit_*`, etc. | Drop with a warning log; never written to `osquery.flags` |
+| Server sends `update_channels` | Ignored; orbit keeps compile-time defaults |
 | Initial git sync fails on startup | Orbit refuses to start |
-| Periodic sync fails | Retain last good index; log a warning; continue blocking unapproved scripts |
+| Periodic sync fails | Retain last good index; log a warning |
 | `--git-policy-repo-url` not set | No policy enforced; normal Fleet behavior |
 
 ## Additional hardening
 
-The git execution policy covers **named script execution** only. The following additional measures are needed for a fully hardened deployment.
+The git execution policy covers script execution and the orbit-controlled portions of osquery configuration. The items below are either trade-offs created by the policy or controls that the policy assumes are already in place.
 
-### Disable osquery distributed queries (enforced automatically)
+### Live queries are disabled (automatic)
 
-Fleet's live query feature (and policy evaluation) works through osquery's [distributed query protocol](https://osquery.readthedocs.io/en/stable/development/osquery-distributed/). This channel operates directly between osqueryd and the Fleet server. A compromised server could use distributed queries to exfiltrate arbitrary data from hosts even if the git script policy is fully enforced.
-
-When `--git-policy-repo-url` is set, orbit automatically writes `--disable_distributed=true` into its osquery flag file on every config refresh, regardless of what the Fleet server's agent options say. A compromised server cannot re-enable distributed queries while the policy is active.
-
-**Trade-off:** This turns off the Fleet live query UI and policy automations that rely on distributed queries for any host running with `--git-policy-repo-url` set. Scheduled query packs (committed to the GitOps repo) continue to work. Evaluate whether this trade-off is acceptable for your environment; high-security segments of your fleet (servers, privileged workstations) are the primary candidates.
+Orbit forces `--disable_distributed=true` whenever the policy is active. **Trade-off:** the Fleet live-query UI and any policy automations that rely on distributed queries no longer work for hosts running with `--git-policy-repo-url` set. Scheduled query packs (committed via GitOps) continue to work. Evaluate whether this is acceptable for your environment; high-security segments (servers, privileged workstations) are the primary candidates.
 
 ### Restrict which scripts are uploaded to Fleet
 
@@ -163,8 +211,8 @@ The git policy is implemented in orbit itself. Ensure your orbit update channel 
 
 | Limitation | Notes |
 |------------|-------|
-| Software installer scripts | Install / post-install / uninstall scripts run by Fleet's software management feature are not yet covered. Tracked in [the roadmap](git-execution-policy-roadmap.md#3-software-installer-scripts--todo). |
-| osquery extensions and startup flags | Extensions and dangerous osquery flags (`--extensions_autoload`, `--config_path`, etc.) are still server-controlled. Tracked in the [extensions](git-execution-policy-roadmap.md#5-osquery-extensions--todo) and [flags](git-execution-policy-roadmap.md#6-other-osquery-startup-flags--todo) sections of the roadmap. |
-| MDM commands | MDM command execution (profiles, DDM, MDM `ShellScript`) is not mediated by orbit. Mitigation requires either skipping MDM enrollment for high-security hosts or out-of-band server-side controls. See [the roadmap](git-execution-policy-roadmap.md#8-mdm-commands--out-of-scope-for-orbit). |
-| Windows git requirement | `git` is not installed by default on Windows. It must be pre-installed or deployed via your MDM before orbit enrollment if you use this feature. |
-| Sync latency | Script changes become effective on a host after the next sync (default 5 minutes). Plan for this delay when deploying emergency remediations. |
+| Software installer **binaries** | The `.pkg`/`.msi`/`.deb` payload is still served from Fleet's CDN. The git policy gates the install / post-install / uninstall scripts; if you want byte-level control over the installer binary, pin a SHA-256 in your install script and verify it before invoking the installer. |
+| MDM commands | Apple/Windows/Linux MDM stacks talk to the Fleet server directly. Orbit cannot mediate MDM `InstallApplication`, profile delivery, DDM declarations, or Apple `ShellScript` commands. For high-security segments, consider skipping MDM enrollment or applying out-of-band server-side approval gates. See [the roadmap](git-execution-policy-roadmap.md#8-mdm-commands--out-of-scope-for-orbit). |
+| Windows `git` requirement | `git` is not installed by default on Windows. It must be pre-installed or deployed via your MDM before orbit enrollment if you use this feature. |
+| Sync latency | Repository changes become effective on a host after the next sync (default 5 minutes). Plan for this delay when deploying emergency remediations. |
+| Live queries | Disabled while the policy is active (orbit forces `--disable_distributed=true`). Use scheduled query packs via GitOps instead. |

@@ -53,6 +53,11 @@ type SoftwareInstallDetails struct {
 	SoftwareInstallerURL *SoftwareInstallerURL `json:"installer_url,omitempty"`
 	// MaxRetries is the number of additional attempts allowed after the initial attempt (0 = no retries).
 	MaxRetries uint `json:"max_retries,omitempty"`
+	// SoftwareTitle is the human-readable title of the software (e.g. "Slack").
+	// Surfaced to orbit so that the git execution policy, if active, can resolve
+	// approved install/post-install/uninstall script content from the policy
+	// repository by title.
+	SoftwareTitle string `json:"software_title,omitempty" db:"software_title"`
 }
 
 type SoftwareInstallerURL struct {

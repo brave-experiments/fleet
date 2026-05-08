@@ -77,10 +77,10 @@ func touchFile(t *testing.T, name string) {
 	require.NoError(t, file.Close())
 }
 
-// TestForceDisableDistributed verifies that when ForceDisableDistributed is set,
+// TestPolicyActiveForcesDisableDistributed verifies that when ForceDisableDistributed is set,
 // orbit overrides whatever the Fleet server sent and writes
 // --disable_distributed=true into the osquery flag file.
-func TestForceDisableDistributed(t *testing.T) {
+func TestPolicyActiveForcesDisableDistributed(t *testing.T) {
 	rootDir := t.TempDir()
 
 	var restartQueued bool
@@ -88,7 +88,7 @@ func TestForceDisableDistributed(t *testing.T) {
 
 	fr := NewFlagReceiver(queueOrbitRestart, FlagUpdateOptions{
 		RootDir:                 rootDir,
-		ForceDisableDistributed: true,
+		PolicyActive: true,
 	})
 
 	// Server explicitly sets disable_distributed=false; we must override to true.
@@ -104,10 +104,10 @@ func TestForceDisableDistributed(t *testing.T) {
 	require.Equal(t, "true", written["--verbose"])
 }
 
-// TestForceDisableDistributedWithoutServerFlags verifies that the flag file is
+// TestPolicyActiveForcesDisableDistributedWithoutServerFlags verifies that the flag file is
 // written even when the server sends no flags at all, since we still need to
 // enforce --disable_distributed=true.
-func TestForceDisableDistributedWithoutServerFlags(t *testing.T) {
+func TestPolicyActiveForcesDisableDistributedWithoutServerFlags(t *testing.T) {
 	rootDir := t.TempDir()
 
 	var restartQueued bool
@@ -115,7 +115,7 @@ func TestForceDisableDistributedWithoutServerFlags(t *testing.T) {
 
 	fr := NewFlagReceiver(queueOrbitRestart, FlagUpdateOptions{
 		RootDir:                 rootDir,
-		ForceDisableDistributed: true,
+		PolicyActive: true,
 	})
 
 	// Server sends no flags at all.
@@ -129,10 +129,47 @@ func TestForceDisableDistributedWithoutServerFlags(t *testing.T) {
 	require.Len(t, written, 1)
 }
 
-// TestNoForceDisableDistributedPreservesDefault confirms that when the option
+// TestPolicyActiveDropsDangerousFlags verifies that flags that could subvert the
+// policy (extensions_autoload, config_path, watcher_*) are stripped before
+// being written to the flag file.
+func TestPolicyActiveDropsDangerousFlags(t *testing.T) {
+	rootDir := t.TempDir()
+	fr := NewFlagReceiver(func(string) {}, FlagUpdateOptions{
+		RootDir:      rootDir,
+		PolicyActive: true,
+	})
+
+	cfg := &fleet.OrbitConfig{
+		Flags: json.RawMessage(`{
+			"extensions_autoload": "/tmp/evil.load",
+			"config_path": "/tmp/evil.conf",
+			"watcher_delay": "10",
+			"audit_allow_config": true,
+			"disable_watchdog": true,
+			"verbose": true
+		}`),
+	}
+	require.NoError(t, fr.Run(cfg))
+
+	written, err := readFlagFile(rootDir)
+	require.NoError(t, err)
+
+	// Dangerous flags must have been dropped.
+	require.NotContains(t, written, "--extensions_autoload")
+	require.NotContains(t, written, "--config_path")
+	require.NotContains(t, written, "--watcher_delay")
+	require.NotContains(t, written, "--audit_allow_config")
+	require.NotContains(t, written, "--disable_watchdog")
+
+	// Innocuous flags must survive, alongside the forced override.
+	require.Equal(t, "true", written["--verbose"])
+	require.Equal(t, "true", written["--disable_distributed"])
+}
+
+// TestPolicyInactivePreservesDefault confirms that when the option
 // is OFF, orbit's behaviour is unchanged: empty server flags = no flag file
 // rewrite, and server-supplied disable_distributed values are kept verbatim.
-func TestNoForceDisableDistributedPreservesDefault(t *testing.T) {
+func TestPolicyInactivePreservesDefault(t *testing.T) {
 	rootDir := t.TempDir()
 
 	fr := NewFlagReceiver(func(string) {}, FlagUpdateOptions{

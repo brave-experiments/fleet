@@ -35,6 +35,17 @@ var allowedExtensions = map[string]bool{
 }
 
 // Enforcer syncs a git repository and serves approved script content from it.
+//
+// The repository is expected to look like:
+//
+//	<repo>/
+//	  scripts/                         (configurable via scriptsDir)
+//	    <script-name>.{sh,ps1,py}      regular & setup-experience scripts
+//	    installers/<software-title>/   software-installer scripts
+//	      install.{sh,ps1}
+//	      post-install.{sh,ps1}
+//	      uninstall.{sh,ps1}
+//	  extensions.allowlist             one allowed osquery extension name per line
 type Enforcer struct {
 	repoURL    string
 	repoBranch string
@@ -42,8 +53,10 @@ type Enforcer struct {
 	scriptsDir string // subdirectory within the repo that holds approved scripts
 	interval   time.Duration
 
-	mu      sync.RWMutex
-	scripts map[string][]byte // script basename → file contents
+	mu                sync.RWMutex
+	scripts           map[string][]byte           // script basename → file contents
+	installerScripts  map[string]map[string][]byte // title → kind ("install"|"post-install"|"uninstall") → contents
+	allowedExtensions map[string]struct{}         // extension name set
 }
 
 // New creates an Enforcer. scriptsDir is the path within the cloned repo
@@ -117,8 +130,15 @@ func (e *Enforcer) sync(ctx context.Context) error {
 
 func (e *Enforcer) buildIndex() error {
 	scriptsPath := filepath.Join(e.repoDir, e.scriptsDir)
+	installersPath := filepath.Join(scriptsPath, "installers")
 
 	newScripts := make(map[string][]byte)
+	newInstallers := make(map[string]map[string][]byte)
+	// A missing scripts directory means an empty index, which blocks everything.
+	// That's the safe default — do not error out.
+	if _, statErr := os.Stat(scriptsPath); os.IsNotExist(statErr) {
+		return e.applyIndex(newScripts, newInstallers)
+	}
 	err := filepath.WalkDir(scriptsPath, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -134,20 +154,82 @@ func (e *Enforcer) buildIndex() error {
 		if err != nil {
 			return fmt.Errorf("read script %s: %w", path, err)
 		}
-		name := filepath.Base(path)
-		newScripts[name] = content
+		// Files under scripts/installers/<title>/<kind>.<ext> are software-installer
+		// scripts indexed by title and kind, not by basename.
+		if rel, ok := stripPrefix(path, installersPath); ok {
+			parts := strings.Split(rel, string(filepath.Separator))
+			if len(parts) == 2 {
+				title := parts[0]
+				kind := strings.TrimSuffix(parts[1], ext)
+				if newInstallers[title] == nil {
+					newInstallers[title] = make(map[string][]byte)
+				}
+				newInstallers[title][kind] = content
+			}
+			return nil
+		}
+		newScripts[filepath.Base(path)] = content
 		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("index scripts dir %s: %w", scriptsPath, err)
 	}
 
+	return e.applyIndex(newScripts, newInstallers)
+}
+
+// applyIndex finishes loading the allowlists and atomically swaps in the new index.
+func (e *Enforcer) applyIndex(scripts map[string][]byte, installers map[string]map[string][]byte) error {
+	allowedExts, err := loadExtensionsAllowlist(filepath.Join(e.repoDir, "extensions.allowlist"))
+	if err != nil {
+		return fmt.Errorf("load extensions allowlist: %w", err)
+	}
+
 	e.mu.Lock()
-	e.scripts = newScripts
+	e.scripts = scripts
+	e.installerScripts = installers
+	e.allowedExtensions = allowedExts
 	e.mu.Unlock()
 
-	log.Info().Int("scripts", len(newScripts)).Str("dir", scriptsPath).Msg("git policy scripts indexed")
+	log.Info().
+		Int("scripts", len(scripts)).
+		Int("installers", len(installers)).
+		Int("extensions", len(allowedExts)).
+		Msg("git policy index updated")
 	return nil
+}
+
+// stripPrefix returns the path with prefix removed, plus whether the prefix matched.
+// Used to detect files inside the installers/ subdirectory.
+func stripPrefix(path, prefix string) (string, bool) {
+	rel, err := filepath.Rel(prefix, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", false
+	}
+	return rel, true
+}
+
+// loadExtensionsAllowlist reads a newline-separated list of allowed osquery
+// extension names. Comments (#) and blank lines are ignored. A missing file
+// produces an empty (but non-nil) set, which means "no extensions allowed" —
+// safer default than allowing everything when the file is forgotten.
+func loadExtensionsAllowlist(path string) (map[string]struct{}, error) {
+	allowed := make(map[string]struct{})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return allowed, nil
+		}
+		return nil, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		allowed[line] = struct{}{}
+	}
+	return allowed, nil
 }
 
 // GetApprovedContent returns the content of the approved script with the given
@@ -168,4 +250,42 @@ func (e *Enforcer) GetApprovedContent(name string) ([]byte, bool) {
 		log.Error().Str("name", name).Msg("git policy: script not in repository; blocking execution")
 	}
 	return content, found
+}
+
+// GetApprovedInstallerScript returns the content of the approved installer
+// script for the given software title and kind ("install", "post-install", or
+// "uninstall"). Returns (nil, false) if the title or kind is not present in
+// the repository.
+func (e *Enforcer) GetApprovedInstallerScript(title, kind string) ([]byte, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	if e.installerScripts == nil {
+		log.Warn().Str("title", title).Msg("git policy index not yet loaded; blocking installer")
+		return nil, false
+	}
+	scripts, ok := e.installerScripts[title]
+	if !ok {
+		return nil, false
+	}
+	content, ok := scripts[kind]
+	return content, ok
+}
+
+// AllowedExtensions returns the set of osquery extension names approved by the
+// policy repository. A nil return means the index has not loaded yet (caller
+// should treat that as "block all"); an empty non-nil map means "no extensions
+// allowed".
+func (e *Enforcer) AllowedExtensions() map[string]struct{} {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.allowedExtensions == nil {
+		return nil
+	}
+	// Return a copy so callers can't mutate our state.
+	out := make(map[string]struct{}, len(e.allowedExtensions))
+	for k := range e.allowedExtensions {
+		out[k] = struct{}{}
+	}
+	return out
 }
