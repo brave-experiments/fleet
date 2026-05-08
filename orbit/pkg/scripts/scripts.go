@@ -24,6 +24,16 @@ type Client interface {
 	SaveHostScriptResult(result *fleet.HostScriptResultPayload) error
 }
 
+// PolicyEnforcer gates script execution against a git-managed allowlist.
+// A nil enforcer means no policy is applied.
+type PolicyEnforcer interface {
+	// GetApprovedContent returns the content from the git repository for the
+	// named script, or (nil, false) if the script is not approved. When a
+	// non-nil result is returned, callers must run that content — not what the
+	// Fleet server sent — so that git is always the authoritative source.
+	GetApprovedContent(name string) ([]byte, bool)
+}
+
 // Runner is the type that processes scripts to execute, taking care of
 // retrieving each script, saving it in a temporary directory, executing it and
 // saving the results.
@@ -31,6 +41,10 @@ type Runner struct {
 	Client                 Client
 	ScriptExecutionEnabled bool
 	ScriptExecutionTimeout time.Duration
+	// PolicyEnforcer, when non-nil, must approve script content before
+	// execution. Scripts whose hash is not in the enforcer's allowlist are
+	// reported back to Fleet as blocked rather than executed.
+	PolicyEnforcer PolicyEnforcer
 
 	// tempDirFn is the function to call to get the temporary directory to use,
 	// inside of which the script-specific subdirectories will be created. If nil,
@@ -105,6 +119,27 @@ func (r *Runner) runOne(script *fleet.HostScriptResult) (finalErr error) {
 				finalErr = fmt.Errorf("remove temp dir: %w", err)
 			}
 		}()
+	}
+
+	if r.PolicyEnforcer != nil {
+		if script.ScriptName == "" {
+			// Anonymous (ad-hoc) scripts have no git-managed name; always block.
+			return r.Client.SaveHostScriptResult(&fleet.HostScriptResultPayload{
+				ExecutionID: script.ExecutionID,
+				Output:      "Script blocked by git execution policy: only named scripts stored in the policy repository may run",
+				ExitCode:    fleet.ExitCodePolicyBlocked,
+			})
+		}
+		content, found := r.PolicyEnforcer.GetApprovedContent(script.ScriptName)
+		if !found {
+			return r.Client.SaveHostScriptResult(&fleet.HostScriptResultPayload{
+				ExecutionID: script.ExecutionID,
+				Output:      fmt.Sprintf("Script blocked by git execution policy: %q is not in the policy repository", script.ScriptName),
+				ExitCode:    fleet.ExitCodePolicyBlocked,
+			})
+		}
+		// Always run the git version, not what Fleet sent.
+		script.ScriptContents = string(content)
 	}
 
 	var ext string

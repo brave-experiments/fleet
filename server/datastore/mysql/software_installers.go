@@ -69,12 +69,16 @@ func (ds *Datastore) GetSoftwareInstallDetails(ctx context.Context, executionId 
     COALESCE(si.pre_install_query, '') AS pre_install_condition,
     inst.contents AS install_script,
     uninst.contents AS uninstall_script,
-    COALESCE(pisnt.contents, '') AS post_install_script
+    COALESCE(pisnt.contents, '') AS post_install_script,
+    COALESCE(st.name, '') AS software_title
   FROM
     host_software_installs hsi
   INNER JOIN
     software_installers si
     ON hsi.software_installer_id = si.id
+  LEFT OUTER JOIN
+    software_titles st
+    ON si.title_id = st.id
   LEFT OUTER JOIN
     script_contents inst
     ON inst.id = si.install_script_content_id
@@ -98,7 +102,8 @@ func (ds *Datastore) GetSoftwareInstallDetails(ctx context.Context, executionId 
     COALESCE(si.pre_install_query, '') AS pre_install_condition,
     inst.contents AS install_script,
     uninst.contents AS uninstall_script,
-    COALESCE(pisnt.contents, '') AS post_install_script
+    COALESCE(pisnt.contents, '') AS post_install_script,
+    COALESCE(st.name, '') AS software_title
   FROM
     upcoming_activities ua
   INNER JOIN
@@ -107,6 +112,9 @@ func (ds *Datastore) GetSoftwareInstallDetails(ctx context.Context, executionId 
   INNER JOIN
     software_installers si
     ON siua.software_installer_id = si.id
+  LEFT OUTER JOIN
+    software_titles st
+    ON si.title_id = st.id
   LEFT OUTER JOIN
     script_contents inst
     ON inst.id = si.install_script_content_id

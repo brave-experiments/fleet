@@ -36,6 +36,7 @@ import (
 	"github.com/fleetdm/fleet/v4/orbit/pkg/augeas"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/bitlocker"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/build"
+	"github.com/fleetdm/fleet/v4/orbit/pkg/gitpolicy"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/constant"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/execuser"
 	"github.com/fleetdm/fleet/v4/orbit/pkg/insecure"
@@ -253,6 +254,34 @@ func main() {
 			Name:    "disable-setup-experience",
 			Usage:   "Disables checking for setup experience on Linux or Windows hosts",
 			EnvVars: []string{"ORBIT_DISABLE_SETUP_EXPERIENCE"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-repo-url",
+			Usage:   "URL of the git repository used as the script execution policy (e.g. https://github.com/org/fleet-gitops). When set, orbit only runs scripts whose name exists in that repository, and always runs the content from git — never what the Fleet server sends.",
+			EnvVars: []string{"ORBIT_GIT_POLICY_REPO_URL"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-repo-branch",
+			Usage:   "Branch of the git policy repository to track",
+			Value:   "main",
+			EnvVars: []string{"ORBIT_GIT_POLICY_REPO_BRANCH"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-repo-dir",
+			Usage:   "Local directory where the git policy repository will be cloned. Defaults to <root-dir>/git-policy.",
+			EnvVars: []string{"ORBIT_GIT_POLICY_REPO_DIR"},
+		},
+		&cli.StringFlag{
+			Name:    "git-policy-scripts-dir",
+			Usage:   "Subdirectory within the policy repository that contains approved scripts",
+			Value:   "scripts",
+			EnvVars: []string{"ORBIT_GIT_POLICY_SCRIPTS_DIR"},
+		},
+		&cli.DurationFlag{
+			Name:    "git-policy-sync-interval",
+			Usage:   "How often orbit re-syncs the git policy repository",
+			Value:   5 * time.Minute,
+			EnvVars: []string{"ORBIT_GIT_POLICY_SYNC_INTERVAL"},
 		},
 	}
 	app.Before = func(c *cli.Context) error {
@@ -1174,8 +1203,29 @@ func orbitAction(c *cli.Context) error {
 		windowsMDMBitlockerCommandFrequency    = time.Hour
 	)
 
+	var policyEnforcer *gitpolicy.Enforcer
+	if repoURL := c.String("git-policy-repo-url"); repoURL != "" {
+		repoDir := c.String("git-policy-repo-dir")
+		if repoDir == "" {
+			repoDir = filepath.Join(c.String("root-dir"), "git-policy")
+		}
+		policyEnforcer = gitpolicy.New(
+			repoURL,
+			c.String("git-policy-repo-branch"),
+			repoDir,
+			c.String("git-policy-scripts-dir"),
+			c.Duration("git-policy-sync-interval"),
+		)
+		policyCtx, policyCancel := context.WithCancel(context.Background())
+		defer policyCancel()
+		if err := policyEnforcer.Start(policyCtx); err != nil {
+			return fmt.Errorf("starting git policy enforcer: %w", err)
+		}
+		log.Info().Str("repo", repoURL).Msg("git execution policy enforcer active")
+	}
+
 	scriptConfigReceiver, scriptsEnabledFn := update.ApplyRunScriptsConfigFetcherMiddleware(
-		c.Bool("enable-scripts"), orbitClient, c.String("root-dir"),
+		c.Bool("enable-scripts"), orbitClient, c.String("root-dir"), policyEnforcer,
 	)
 	orbitClient.RegisterConfigReceiver(scriptConfigReceiver)
 
@@ -1258,6 +1308,12 @@ func orbitAction(c *cli.Context) error {
 
 	flagUpdateReceiver := update.NewFlagReceiver(orbitClient.TriggerOrbitRestart, update.FlagUpdateOptions{
 		RootDir: c.String("root-dir"),
+		// When the git execution policy is enabled, the flag runner additionally
+		// forces --disable_distributed=true and drops a denylist of dangerous
+		// osquery startup flags (see flag_runner.go). This prevents a compromised
+		// Fleet server from re-enabling distributed queries or smuggling in
+		// flags like --extensions_autoload that bypass other policy layers.
+		PolicyActive: policyEnforcer != nil,
 	})
 	orbitClient.RegisterConfigReceiver(flagUpdateReceiver)
 
@@ -1269,6 +1325,7 @@ func orbitAction(c *cli.Context) error {
 				DesktopPath:  desktopPath,
 			},
 			c.Bool("fleet-desktop"),
+			policyEnforcer != nil,
 			orbitClient.TriggerOrbitRestart,
 		)
 
@@ -1279,8 +1336,24 @@ func orbitAction(c *cli.Context) error {
 	// for extensions autoupdate, we can only proceed after orbit is enrolled in fleet
 	// and all relevant things for it (like certs, enroll secrets, tls proxy, etc) is configured
 	if !c.Bool("disable-updates") || c.Bool("dev-mode") {
+		var allowedExtensionsFn func() map[string]struct{}
+		if policyEnforcer != nil {
+			// Git execution policy active: only load extensions whose names appear
+			// in extensions.allowlist in the policy repository. The callback
+			// re-reads on every config refresh so allowlist updates take effect
+			// within one git sync interval. A nil index (not yet loaded) is
+			// treated as "no extensions allowed".
+			allowedExtensionsFn = func() map[string]struct{} {
+				allowed := policyEnforcer.AllowedExtensions()
+				if allowed == nil {
+					return map[string]struct{}{}
+				}
+				return allowed
+			}
+		}
 		extRunner := update.NewExtensionConfigUpdateRunner(update.ExtensionUpdateOptions{
-			RootDir: c.String("root-dir"),
+			RootDir:           c.String("root-dir"),
+			AllowedExtensions: allowedExtensionsFn,
 		}, updateRunner, orbitClient.TriggerOrbitRestart)
 
 		// call UpdateAction on the updateRunner after we have fetched extensions from Fleet
@@ -1519,6 +1592,12 @@ func orbitAction(c *cli.Context) error {
 	}
 
 	softwareRunner := installer.NewRunner(orbitClient, r.ExtensionSocketPath(), scriptsEnabledFn, c.String("root-dir"))
+	if policyEnforcer != nil {
+		// Git execution policy is active: route install/post-install/uninstall
+		// scripts through the policy repository instead of trusting the Fleet
+		// server's payload.
+		softwareRunner.PolicyEnforcer = policyEnforcer
+	}
 	orbitClient.RegisterConfigReceiver(softwareRunner)
 
 	if runtime.GOOS == "darwin" {
@@ -2258,6 +2337,11 @@ type serverOverridesRunner struct {
 	desktopEnabled      bool
 	cancel              chan struct{}
 	triggerOrbitRestart func(reason string)
+	// policyActive, when true, indicates the git execution policy is in effect.
+	// In that mode we ignore server-supplied UpdateChannels: a compromised server
+	// could otherwise pin hosts to a vulnerable channel or flip them to a
+	// malicious-but-TUF-signed binary. Channels stay at their compile-time defaults.
+	policyActive bool
 }
 
 // newServerOverridesReveiver creates a runner for updating server overrides configuration with values fetched from Fleet.
@@ -2265,12 +2349,14 @@ func newServerOverridesReceiver(
 	rootDir string,
 	fallbackCfg fallbackServerOverridesConfig,
 	desktopEnabled bool,
+	policyActive bool,
 	triggerOrbitRestart func(reason string),
 ) *serverOverridesRunner {
 	return &serverOverridesRunner{
 		rootDir:             rootDir,
 		fallbackCfg:         fallbackCfg,
 		desktopEnabled:      desktopEnabled,
+		policyActive:        policyActive,
 		cancel:              make(chan struct{}),
 		triggerOrbitRestart: triggerOrbitRestart,
 	}
@@ -2280,6 +2366,14 @@ func (r *serverOverridesRunner) Run(orbitCfg *fleet.OrbitConfig) error {
 	overrideCfg, err := loadServerOverrides(r.rootDir)
 	if err != nil {
 		return err
+	}
+
+	if r.policyActive {
+		// Git execution policy is active: do not let the Fleet server change
+		// orbit/osqueryd/desktop update channels. Keeping the values at their
+		// compile-time defaults prevents a compromised server from pinning hosts
+		// to a vulnerable or attacker-chosen channel.
+		return nil
 	}
 
 	if orbitCfg.UpdateChannels == nil {

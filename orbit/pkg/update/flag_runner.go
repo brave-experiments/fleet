@@ -16,6 +16,43 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// dangerousFlagPrefixes is the set of osquery startup flag *prefixes* that the
+// git execution policy refuses to forward from the Fleet server. A compromised
+// server could otherwise use these to redirect osquery's config, load arbitrary
+// extensions, neuter the watchdog, or disable auditing.
+var dangerousFlagPrefixes = []string{
+	"--extensions_autoload",        // load extensions from an attacker-controlled file
+	"--extensions_default_index",   // bypass extensions allowlist
+	"--config_path",                // re-read config from an attacker-controlled path
+	"--config_plugin",              // swap in a different config source
+	"--watcher",                    // watcher_*: disable osquery's process watchdog
+	"--audit_",                     // audit_*: turn off audit logging
+	"--disable_watchdog",           // explicit watchdog disable
+	"--disable_audit",              // explicit audit disable
+	"--logger_path",                // redirect logs to attacker-controlled path
+	"--enable_extensions_watchdog", // toggle extension behavior
+}
+
+// isDangerousFlag reports whether a flag (with leading "--") is on the policy denylist.
+// Each entry in dangerousFlagPrefixes matches either the exact flag, the flag with
+// "=" or "_" continuation, or — for entries already ending in "_" — anything
+// starting with that prefix. This catches families like --watcher_delay,
+// --audit_allow_config, etc.
+func isDangerousFlag(flag string) bool {
+	for _, prefix := range dangerousFlagPrefixes {
+		if strings.HasSuffix(prefix, "_") {
+			if strings.HasPrefix(flag, prefix) {
+				return true
+			}
+			continue
+		}
+		if flag == prefix || strings.HasPrefix(flag, prefix+"=") || strings.HasPrefix(flag, prefix+"_") {
+			return true
+		}
+	}
+	return false
+}
+
 // FlagRunner is a specialized runner to periodically check and update flags from Fleet
 // It is designed with Execute and Interrupt functions to be compatible with oklog/run
 //
@@ -30,6 +67,17 @@ type FlagRunner struct {
 type FlagUpdateOptions struct {
 	// RootDir is the root directory for orbit state
 	RootDir string
+	// PolicyActive, if true, indicates that the git execution policy is in
+	// effect. While active, the flag runner:
+	//   - Forces --disable_distributed=true (distributed queries bypass orbit
+	//     entirely and would otherwise let a compromised Fleet server exfiltrate
+	//     data or trigger osquery-side execution).
+	//   - Drops a small denylist of dangerous osquery startup flags
+	//     (extensions_autoload, config_path, watcher_*, audit_*) before they are
+	//     written to the flag file.
+	//   - Writes the flag file even if the server sent no flags, so the
+	//     enforced flags above always take effect.
+	PolicyActive bool
 }
 
 // NewFlagRunner creates a new runner with provided options
@@ -57,14 +105,32 @@ func (r *FlagRunner) Run(config *fleet.OrbitConfig) error {
 		flagFileExists = false
 	}
 
-	if len(config.Flags) == 0 {
+	if len(config.Flags) == 0 && !r.opt.PolicyActive {
 		// command_line_flags not set in YAML, nothing to do
 		return nil
 	}
 
-	osqueryFlagMapFromFleet, err := getFlagsFromJSON(config.Flags)
-	if err != nil {
-		return fmt.Errorf("error parsing flags: %w", err)
+	var osqueryFlagMapFromFleet map[string]string
+	if len(config.Flags) > 0 {
+		osqueryFlagMapFromFleet, err = getFlagsFromJSON(config.Flags)
+		if err != nil {
+			return fmt.Errorf("error parsing flags: %w", err)
+		}
+	} else {
+		osqueryFlagMapFromFleet = make(map[string]string)
+	}
+
+	// When the git execution policy is active:
+	//   1. Drop dangerous startup flags before they hit the flag file.
+	//   2. Force --disable_distributed=true regardless of what the server said.
+	if r.opt.PolicyActive {
+		for k := range osqueryFlagMapFromFleet {
+			if isDangerousFlag(k) {
+				log.Warn().Str("flag", k).Msg("git policy: dropping dangerous osquery startup flag from server")
+				delete(osqueryFlagMapFromFleet, k)
+			}
+		}
+		osqueryFlagMapFromFleet["--disable_distributed"] = "true"
 	}
 
 	// compare both flags, if they are equal, nothing to do
@@ -97,6 +163,13 @@ type ExtensionRunner struct {
 type ExtensionUpdateOptions struct {
 	// RootDir is the root directory for orbit state
 	RootDir string
+	// AllowedExtensions, when non-nil, returns the current set of extension
+	// names allowed by the git execution policy. It is consulted on every
+	// config refresh so that allowlist updates committed to the policy
+	// repository take effect within one git sync interval. A nil function
+	// means no policy is applied (legacy behavior — all server-supplied
+	// extensions are loaded).
+	AllowedExtensions func() map[string]struct{}
 }
 
 // NewExtensionConfigUpdateRunner creates a new runner with provided options
@@ -154,6 +227,19 @@ func (r *ExtensionRunner) Run(config *fleet.OrbitConfig) error {
 
 	// Filter out extensions not targeted to this OS.
 	extensions.FilterByHostPlatform(runtime.GOOS, runtime.GOARCH)
+
+	// Git execution policy: if an allowlist is configured, drop any extension
+	// the server tried to load that isn't in the policy repository. A nil
+	// callback means no policy is applied (legacy behavior).
+	if r.opt.AllowedExtensions != nil {
+		allowed := r.opt.AllowedExtensions()
+		for name := range extensions {
+			if _, ok := allowed[name]; !ok {
+				log.Warn().Str("extension", name).Msg("git policy: dropping extension not in allowlist")
+				delete(extensions, name)
+			}
+		}
+	}
 
 	var sb strings.Builder
 	for extensionName, extensionInfo := range extensions {

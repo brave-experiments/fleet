@@ -262,6 +262,10 @@ type HostScriptResult struct {
 	// ScriptID is the id of the saved script to execute, or nil if this was an
 	// anonymous script execution.
 	ScriptID *uint `json:"script_id" db:"script_id"`
+	// ScriptName is the name (filename) of the saved script, or empty for
+	// anonymous executions. Populated when returning the result to orbit so
+	// that the git execution policy can look up the approved content by name.
+	ScriptName string `json:"script_name" db:"script_name"`
 	// PolicyID is the id of the policy that triggered the script execution, or
 	// nil if the execution was not triggered by a policy failure
 	PolicyID *uint `json:"policy_id" db:"policy_id"`
